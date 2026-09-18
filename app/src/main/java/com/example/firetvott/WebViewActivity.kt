@@ -1,6 +1,9 @@
 package com.example.firetvott
 
 import android.annotation.SuppressLint
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -9,6 +12,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -22,12 +26,16 @@ import androidx.appcompat.app.AppCompatActivity
 /**
  * Hosts a single OTT web app inside a WebView, tuned for Fire TV.
  *
- * IMPORTANT: all remote-key handling happens in dispatchKeyEvent(), not onKeyDown().
- * onKeyDown() is only called if nothing else in the view tree consumed the event first —
- * and the WebView frequently DOES consume D-pad and media keys itself (for internal
- * scrolling/media-session handling), which silently breaks both the mode toggle and the
- * cursor movement. Intercepting in dispatchKeyEvent() guarantees our app sees the key
- * first, before the WebView gets a chance to swallow it.
+ * Key handling happens in dispatchKeyEvent(), not onKeyDown() — the WebView frequently
+ * consumes D-pad/media keys itself before onKeyDown() would ever see them, which is why
+ * dispatchKeyEvent() (called earlier, before the WebView gets a chance) is used instead.
+ *
+ * Also includes an external-player fallback: some OTT sites serve video the WebView's
+ * hardware-accelerated renderer fails to draw (audio plays, no picture) even though
+ * decoding succeeds. A small JS bridge detects that failure and hands the stream off to
+ * an installed video app (VLC, MX Player, etc.) instead. This only works for non-DRM
+ * streams — DRM-protected video can't be redirected this way since external players lack
+ * the WebView's decryption keys.
  */
 class WebViewActivity : AppCompatActivity() {
 
@@ -49,6 +57,50 @@ class WebViewActivity : AppCompatActivity() {
         private const val MOBILE_UA =
             "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+
+        // Auto-launch the external player the instant "audio but no picture" is detected,
+        // instead of waiting for the user to press Fast-Forward. Set to false if you'd
+        // rather it only ever trigger manually.
+        private const val AUTO_FALLBACK_ON_BROKEN_VIDEO = true
+
+        private val VIDEO_WATCHER_JS = """
+            (function() {
+              if (window.__nativePlayerBridgeInstalled) return;
+              window.__nativePlayerBridgeInstalled = true;
+
+              function trySrc(v) {
+                try { return v.currentSrc || v.src || ''; } catch(e) { return ''; }
+              }
+
+              function watch(v) {
+                if (v.__watched) return;
+                v.__watched = true;
+                var brokenReported = false;
+                setInterval(function() {
+                  if (!document.body.contains(v)) return;
+                  var src = trySrc(v);
+                  if (src && window.NativePlayer) {
+                    try { window.NativePlayer.onVideoUrlDetected(src); } catch(e) {}
+                  }
+                  if (!brokenReported && !v.paused && v.currentTime > 2 && v.videoWidth === 0) {
+                    brokenReported = true;
+                    if (window.NativePlayer) {
+                      try { window.NativePlayer.onVideoBroken(src); } catch(e) {}
+                    }
+                  }
+                }, 1500);
+              }
+
+              function scan() {
+                document.querySelectorAll('video').forEach(watch);
+              }
+
+              scan();
+              var mo = new MutationObserver(scan);
+              mo.observe(document.documentElement, { childList: true, subtree: true });
+              setInterval(scan, 3000);
+            })();
+        """.trimIndent()
     }
 
     private lateinit var rootContainer: FrameLayout
@@ -64,14 +116,39 @@ class WebViewActivity : AppCompatActivity() {
     private var cursorY = 0f
     private var cursorSizePx = 0
 
-    // Tracks a long-press on DPAD_CENTER as a second, always-available way to toggle
-    // modes, in case a remote lacks a working Play/Pause or Menu button.
     private var centerDownTime = 0L
     private var longPressToggleFired = false
     private val LONG_PRESS_MS = 550L
 
+    private var lastDetectedVideoUrl: String? = null
+
     private val hideBadgeHandler = Handler(Looper.getMainLooper())
     private val hideBadgeRunnable = Runnable { modeBadge.visibility = View.GONE }
+
+    /** Exposed to page JavaScript as window.NativePlayer.* */
+    private inner class NativePlayerBridge {
+        @JavascriptInterface
+        fun onVideoUrlDetected(url: String) {
+            lastDetectedVideoUrl = url
+        }
+
+        @JavascriptInterface
+        fun onVideoBroken(url: String) {
+            lastDetectedVideoUrl = url
+            runOnUiThread {
+                if (AUTO_FALLBACK_ON_BROKEN_VIDEO) {
+                    Toast.makeText(
+                        this@WebViewActivity,
+                        "No picture detected — opening in external player",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    launchExternalPlayer(url)
+                } else {
+                    showModeBadge("No picture? Press FF for external player")
+                }
+            }
+        }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -100,11 +177,10 @@ class WebViewActivity : AppCompatActivity() {
             positionCursorView()
         }
 
-        // Let the badge briefly explain the controls on first load.
-        showModeBadge("Play/Pause = toggle mouse mode")
+        showModeBadge("Play/Pause=Mouse Mode  |  FF=External Player")
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
+    @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
     private fun configureWebView(useDesktopUA: Boolean) {
         val settings: WebSettings = webView.settings
         settings.javaScriptEnabled = true
@@ -118,6 +194,7 @@ class WebViewActivity : AppCompatActivity() {
         settings.userAgentString = if (useDesktopUA) DESKTOP_UA else MOBILE_UA
 
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        webView.addJavascriptInterface(NativePlayerBridge(), "NativePlayer")
 
         val cookieManager = CookieManager.getInstance()
         cookieManager.setAcceptCookie(true)
@@ -131,6 +208,7 @@ class WebViewActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
                 CookieManager.getInstance().flush()
+                view.evaluateJavascript(VIDEO_WATCHER_JS, null)
             }
         }
 
@@ -178,17 +256,19 @@ class WebViewActivity : AppCompatActivity() {
         val isDown = event.action == KeyEvent.ACTION_DOWN
         val isUp = event.action == KeyEvent.ACTION_UP
 
-        // --- Toggle shortcut #1: Play/Pause or Menu button ---
         if (keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE || keyCode == KeyEvent.KEYCODE_MENU) {
             if (isDown) toggleMode()
-            return true // consume both down & up so the WebView never sees it
+            return true
         }
 
-        // --- Toggle shortcut #2: long-press DPAD_CENTER (works on any remote) ---
+        // Fast-Forward = manually open the last-detected video stream in an external player.
+        if (keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD) {
+            if (isDown) launchExternalPlayer(null)
+            return true
+        }
+
         if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER) {
             if (currentMode == MODE_DPAD) {
-                // In D-pad mode, center should behave like a normal "click"/select —
-                // but we still watch for a long-press to offer the toggle here too.
                 if (isDown && event.repeatCount == 0) {
                     centerDownTime = System.currentTimeMillis()
                     longPressToggleFired = false
@@ -201,13 +281,10 @@ class WebViewActivity : AppCompatActivity() {
                 } else if (isUp) {
                     if (longPressToggleFired) {
                         longPressToggleFired = false
-                        return true // swallow the "up" so it doesn't also fire a click
+                        return true
                     }
                 }
-                // Not a long-press: let it fall through to normal D-pad click handling below.
             } else {
-                // MODE_MOUSE: center always means "click at cursor", never a toggle here
-                // (Play/Pause already covers toggling while in mouse mode).
                 if (isDown && event.repeatCount == 0) {
                     dispatchClickAtCursor()
                 }
@@ -231,11 +308,9 @@ class WebViewActivity : AppCompatActivity() {
                     KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN
                 )
             ) {
-                return true // consume the matching "up" too, keeps WebView from reacting
+                return true
             }
         } else {
-            // MODE_DPAD: back button still needs explicit handling since the WebView
-            // may consume it for its own history navigation inconsistently.
             if (keyCode == KeyEvent.KEYCODE_BACK && isDown && webView.canGoBack()) {
                 webView.goBack()
                 return true
@@ -303,7 +378,29 @@ class WebViewActivity : AppCompatActivity() {
         modeBadge.visibility = View.VISIBLE
         modeBadge.bringToFront()
         hideBadgeHandler.removeCallbacks(hideBadgeRunnable)
-        hideBadgeHandler.postDelayed(hideBadgeRunnable, 2000)
+        hideBadgeHandler.postDelayed(hideBadgeRunnable, 2500)
+    }
+
+    private fun launchExternalPlayer(urlOverride: String?) {
+        val target = urlOverride ?: lastDetectedVideoUrl
+        if (target.isNullOrBlank()) {
+            Toast.makeText(this, "No video stream detected on this page yet", Toast.LENGTH_SHORT).show()
+            return
+        }
+        try {
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(Uri.parse(target), "video/*")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(intent)
+        } catch (e: ActivityNotFoundException) {
+            Toast.makeText(
+                this,
+                "No video player app found — install VLC from the Amazon Appstore",
+                Toast.LENGTH_LONG
+            ).show()
+        }
     }
 
     override fun onBackPressed() {
