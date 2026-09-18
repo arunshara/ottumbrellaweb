@@ -129,12 +129,18 @@ class WebViewActivity : AppCompatActivity() {
     private inner class NativePlayerBridge {
         @JavascriptInterface
         fun onVideoUrlDetected(url: String) {
-            lastDetectedVideoUrl = url
+            // blob: URLs (from MediaSource/hls.js-style playback) can't be opened by an
+            // external player — only keep this if we don't already have a real network URL.
+            if (!url.startsWith("blob:")) {
+                lastDetectedVideoUrl = url
+            }
         }
 
         @JavascriptInterface
         fun onVideoBroken(url: String) {
-            lastDetectedVideoUrl = url
+            if (!url.startsWith("blob:")) {
+                lastDetectedVideoUrl = url
+            }
             runOnUiThread {
                 if (AUTO_FALLBACK_ON_BROKEN_VIDEO) {
                     Toast.makeText(
@@ -142,7 +148,7 @@ class WebViewActivity : AppCompatActivity() {
                         "No picture detected — opening in external player",
                         Toast.LENGTH_LONG
                     ).show()
-                    launchExternalPlayer(url)
+                    launchExternalPlayer(null)
                 } else {
                     showModeBadge("No picture? Press FF for external player")
                 }
@@ -193,7 +199,12 @@ class WebViewActivity : AppCompatActivity() {
         settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         settings.userAgentString = if (useDesktopUA) DESKTOP_UA else MOBILE_UA
 
-        webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        // NOTE: deliberately NOT calling webView.setLayerType(LAYER_TYPE_HARDWARE, null) here.
+        // Forcing a hardware layer on the WebView itself is a known trigger for "audio plays,
+        // video area stays black" — it can interfere with how the video decoder's own hardware
+        // overlay surface composites through the WebView. The window already has hardware
+        // acceleration on via the manifest, which is sufficient; leaving the WebView's own
+        // layer type at its default avoids the conflict.
         webView.addJavascriptInterface(NativePlayerBridge(), "NativePlayer")
 
         val cookieManager = CookieManager.getInstance()
@@ -203,6 +214,27 @@ class WebViewActivity : AppCompatActivity() {
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: android.webkit.WebResourceRequest): Boolean {
                 return false
+            }
+
+            override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                // Reset on navigation so a stale URL from a previous page/video isn't reused.
+                lastDetectedVideoUrl = null
+            }
+
+            // Sees every network request the WebView makes — including the real stream URL
+            // for pages that only expose a blob: URL on the <video> tag itself (MediaSource
+            // / hls.js-style playback). This is the reliable way to get an external-player-
+            // usable link regardless of how the page's JS player is implemented.
+            override fun shouldInterceptRequest(
+                view: WebView,
+                request: android.webkit.WebResourceRequest
+            ): android.webkit.WebResourceResponse? {
+                val url = request.url.toString()
+                if (isCandidateVideoUrl(url)) {
+                    lastDetectedVideoUrl = url
+                }
+                return super.shouldInterceptRequest(view, request)
             }
 
             override fun onPageFinished(view: WebView, url: String?) {
@@ -318,6 +350,29 @@ class WebViewActivity : AppCompatActivity() {
         }
 
         return super.dispatchKeyEvent(event)
+    }
+
+    /**
+     * Recognizes URLs likely to be a playable manifest/video file, as opposed to
+     * unrelated requests (ads, analytics, images, individual .ts segments).
+     * Prefers not to overwrite an already-captured .m3u8 with a segment request.
+     */
+    private fun isCandidateVideoUrl(url: String): Boolean {
+        val lower = url.lowercase()
+        if (lower.contains(".ts?") || lower.endsWith(".ts")) return false // individual HLS segment, not the manifest
+        val looksLikeManifestOrVideo =
+            lower.contains(".m3u8") || lower.contains(".mpd") ||
+                lower.contains(".mp4") || lower.contains(".webm")
+        if (!looksLikeManifestOrVideo) return false
+        // Once we already have an .m3u8/.mpd manifest, don't let a later .mp4 (often a
+        // thumbnail/preview clip) silently replace it.
+        val current = lastDetectedVideoUrl
+        if (current != null && (current.contains(".m3u8") || current.contains(".mpd")) &&
+            !(lower.contains(".m3u8") || lower.contains(".mpd"))
+        ) {
+            return false
+        }
+        return true
     }
 
     private fun stepFor(event: KeyEvent): Float {
