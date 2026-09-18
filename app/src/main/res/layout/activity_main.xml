@@ -21,6 +21,8 @@
         android:layout_marginTop="80dp"
         android:paddingStart="24dp"
         android:paddingEnd="24dp"
-        android:clipToPadding="false" />
+        android:clipToPadding="false"
+        android:focusable="true"
+        android:descendantFocusability="afterDescendants" />
 
 </FrameLayout>

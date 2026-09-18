@@ -20,14 +20,14 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 
 /**
- * Hosts a single OTT web app inside a WebView, tuned for Fire TV:
- *  - Persistent login sessions (cookies + DOM/database storage survive app restarts)
- *  - Hardware-accelerated HTML5 video
- *  - Two remote-control modes:
- *      MODE_DPAD  -> standard focus-based navigation (works with pages that have visible focus states)
- *      MODE_MOUSE -> an on-screen cursor you glide with the D-pad and "click" with OK/Center
- *                    (needed for pages built for mouse/touch that ignore D-pad focus entirely)
- *  - Toggle between modes with the Play/Pause button (falls back to Menu button on some remotes)
+ * Hosts a single OTT web app inside a WebView, tuned for Fire TV.
+ *
+ * IMPORTANT: all remote-key handling happens in dispatchKeyEvent(), not onKeyDown().
+ * onKeyDown() is only called if nothing else in the view tree consumed the event first —
+ * and the WebView frequently DOES consume D-pad and media keys itself (for internal
+ * scrolling/media-session handling), which silently breaks both the mode toggle and the
+ * cursor movement. Intercepting in dispatchKeyEvent() guarantees our app sees the key
+ * first, before the WebView gets a chance to swallow it.
  */
 class WebViewActivity : AppCompatActivity() {
 
@@ -39,8 +39,8 @@ class WebViewActivity : AppCompatActivity() {
         private const val MODE_DPAD = 0
         private const val MODE_MOUSE = 1
 
-        private const val BASE_CURSOR_STEP = 18f   // px per key event at rest
-        private const val MAX_CURSOR_STEP = 55f    // px per key event once "held"/repeating
+        private const val BASE_CURSOR_STEP = 18f
+        private const val MAX_CURSOR_STEP = 55f
         private const val CURSOR_SIZE_DP = 28
 
         private const val DESKTOP_UA =
@@ -63,6 +63,12 @@ class WebViewActivity : AppCompatActivity() {
     private var cursorX = 0f
     private var cursorY = 0f
     private var cursorSizePx = 0
+
+    // Tracks a long-press on DPAD_CENTER as a second, always-available way to toggle
+    // modes, in case a remote lacks a working Play/Pause or Menu button.
+    private var centerDownTime = 0L
+    private var longPressToggleFired = false
+    private val LONG_PRESS_MS = 550L
 
     private val hideBadgeHandler = Handler(Looper.getMainLooper())
     private val hideBadgeRunnable = Runnable { modeBadge.visibility = View.GONE }
@@ -87,13 +93,15 @@ class WebViewActivity : AppCompatActivity() {
         configureWebView(desktopUA)
         webView.loadUrl(url)
 
-        // Start in D-pad mode; center the cursor for when the user switches to mouse mode.
         setMode(MODE_DPAD, announce = false)
         rootContainer.post {
             cursorX = rootContainer.width / 2f
             cursorY = rootContainer.height / 2f
             positionCursorView()
         }
+
+        // Let the badge briefly explain the controls on first load.
+        showModeBadge("Play/Pause = toggle mouse mode")
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -107,21 +115,15 @@ class WebViewActivity : AppCompatActivity() {
         settings.mediaPlaybackRequiresUserGesture = false
         settings.cacheMode = WebSettings.LOAD_DEFAULT
         settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-
-        // Chrome UA so services serve their full HTML5/Widevine DRM video player
-        // instead of a stripped-down "unsupported browser" fallback page.
         settings.userAgentString = if (useDesktopUA) DESKTOP_UA else MOBILE_UA
 
-        // Smooth video playback.
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
 
-        // Persistent login sessions across app restarts / device reboots.
         val cookieManager = CookieManager.getInstance()
         cookieManager.setAcceptCookie(true)
         cookieManager.setAcceptThirdPartyCookies(webView, true)
 
         webView.webViewClient = object : WebViewClient() {
-            // Keep all navigation inside the WebView instead of bouncing out to a browser/app chooser.
             override fun shouldOverrideUrlLoading(view: WebView, request: android.webkit.WebResourceRequest): Boolean {
                 return false
             }
@@ -133,7 +135,6 @@ class WebViewActivity : AppCompatActivity() {
         }
 
         webView.webChromeClient = object : WebChromeClient() {
-            // Full-screen playback support (most OTT players call this for their fullscreen video element).
             override fun onShowCustomView(view: View, callback: CustomViewCallback) {
                 if (customView != null) {
                     callback.onCustomViewHidden()
@@ -162,7 +163,6 @@ class WebViewActivity : AppCompatActivity() {
                 customViewCallback = null
             }
 
-            // Widevine DRM permission prompts (EME) - auto-grant so playback isn't blocked.
             override fun onPermissionRequest(request: android.webkit.PermissionRequest) {
                 runOnUiThread { request.grant(request.resources) }
             }
@@ -170,51 +170,81 @@ class WebViewActivity : AppCompatActivity() {
     }
 
     // ---------------------------------------------------------------------
-    // Dual-mode remote input handling
+    // Dual-mode remote input handling — intercepted BEFORE the WebView sees it
     // ---------------------------------------------------------------------
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        // Mode toggle: Play/Pause is the most reliable "extra" button on Fire TV remotes.
-        // Menu button is offered as a fallback since some third-party remotes lack Play/Pause.
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val keyCode = event.keyCode
+        val isDown = event.action == KeyEvent.ACTION_DOWN
+        val isUp = event.action == KeyEvent.ACTION_UP
+
+        // --- Toggle shortcut #1: Play/Pause or Menu button ---
         if (keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE || keyCode == KeyEvent.KEYCODE_MENU) {
-            toggleMode()
-            return true
+            if (isDown) toggleMode()
+            return true // consume both down & up so the WebView never sees it
+        }
+
+        // --- Toggle shortcut #2: long-press DPAD_CENTER (works on any remote) ---
+        if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER) {
+            if (currentMode == MODE_DPAD) {
+                // In D-pad mode, center should behave like a normal "click"/select —
+                // but we still watch for a long-press to offer the toggle here too.
+                if (isDown && event.repeatCount == 0) {
+                    centerDownTime = System.currentTimeMillis()
+                    longPressToggleFired = false
+                } else if (isDown && event.repeatCount > 0 && !longPressToggleFired) {
+                    if (System.currentTimeMillis() - centerDownTime >= LONG_PRESS_MS) {
+                        longPressToggleFired = true
+                        toggleMode()
+                        return true
+                    }
+                } else if (isUp) {
+                    if (longPressToggleFired) {
+                        longPressToggleFired = false
+                        return true // swallow the "up" so it doesn't also fire a click
+                    }
+                }
+                // Not a long-press: let it fall through to normal D-pad click handling below.
+            } else {
+                // MODE_MOUSE: center always means "click at cursor", never a toggle here
+                // (Play/Pause already covers toggling while in mouse mode).
+                if (isDown && event.repeatCount == 0) {
+                    dispatchClickAtCursor()
+                }
+                return true
+            }
         }
 
         if (currentMode == MODE_MOUSE) {
-            when (keyCode) {
-                KeyEvent.KEYCODE_DPAD_LEFT -> {
-                    moveCursor(-stepFor(event), 0f); return true
-                }
-                KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                    moveCursor(stepFor(event), 0f); return true
-                }
-                KeyEvent.KEYCODE_DPAD_UP -> {
-                    moveCursor(0f, -stepFor(event)); return true
-                }
-                KeyEvent.KEYCODE_DPAD_DOWN -> {
-                    moveCursor(0f, stepFor(event)); return true
-                }
-                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
-                    dispatchClickAtCursor(); return true
-                }
-                KeyEvent.KEYCODE_BACK -> {
-                    if (webView.canGoBack()) {
-                        webView.goBack(); return true
+            if (isDown) {
+                when (keyCode) {
+                    KeyEvent.KEYCODE_DPAD_LEFT -> { moveCursor(-stepFor(event), 0f); return true }
+                    KeyEvent.KEYCODE_DPAD_RIGHT -> { moveCursor(stepFor(event), 0f); return true }
+                    KeyEvent.KEYCODE_DPAD_UP -> { moveCursor(0f, -stepFor(event)); return true }
+                    KeyEvent.KEYCODE_DPAD_DOWN -> { moveCursor(0f, stepFor(event)); return true }
+                    KeyEvent.KEYCODE_BACK -> {
+                        if (webView.canGoBack()) { webView.goBack(); return true }
                     }
                 }
+            } else if (isUp && keyCode in intArrayOf(
+                    KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT,
+                    KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN
+                )
+            ) {
+                return true // consume the matching "up" too, keeps WebView from reacting
             }
         } else {
-            // MODE_DPAD: let Android's normal focus/key handling drive the page where possible.
-            if (keyCode == KeyEvent.KEYCODE_BACK && webView.canGoBack()) {
+            // MODE_DPAD: back button still needs explicit handling since the WebView
+            // may consume it for its own history navigation inconsistently.
+            if (keyCode == KeyEvent.KEYCODE_BACK && isDown && webView.canGoBack()) {
                 webView.goBack()
                 return true
             }
         }
-        return super.onKeyDown(keyCode, event)
+
+        return super.dispatchKeyEvent(event)
     }
 
-    /** Accelerate movement the longer a key is held (Android repeats onKeyDown with repeatCount). */
     private fun stepFor(event: KeyEvent): Float {
         val accelerated = BASE_CURSOR_STEP + (event.repeatCount * 4f)
         return accelerated.coerceAtMost(MAX_CURSOR_STEP)
@@ -235,7 +265,6 @@ class WebViewActivity : AppCompatActivity() {
         cursorView.layoutParams = params
     }
 
-    /** Simulates a real touch (ACTION_DOWN then ACTION_UP) on the WebView at the cursor's position. */
     private fun dispatchClickAtCursor() {
         val centerX = cursorX + cursorSizePx / 2f
         val centerY = cursorY + cursorSizePx / 2f
@@ -274,7 +303,7 @@ class WebViewActivity : AppCompatActivity() {
         modeBadge.visibility = View.VISIBLE
         modeBadge.bringToFront()
         hideBadgeHandler.removeCallbacks(hideBadgeRunnable)
-        hideBadgeHandler.postDelayed(hideBadgeRunnable, 1500)
+        hideBadgeHandler.postDelayed(hideBadgeRunnable, 2000)
     }
 
     override fun onBackPressed() {
